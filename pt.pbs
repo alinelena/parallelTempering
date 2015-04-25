@@ -1,0 +1,133 @@
+#!/bin/sh
+#PBS -N PT
+#PBS -l walltime=00:30:00
+#PBS -l nodes=5:ppn=12
+#PBS -A ucd01
+cd $PBS_O_WORKDIR
+
+nTemps=5
+procs=12
+tries=2
+restart="y"
+
+module load intel-mkl/10.3.7.256 numpy-gnu
+
+cp2k="/ichec/home/users/alin/playground/cp2kblue/exe/stokes-intel/cp2k.popt"
+mpiLaunch="mpiexec"
+
+echo "===========================<<" >>Log
+a=`date`
+echo "job id: $PBS_JOBID started on $a" >>Log
+finger $USER >> Log
+echo "digging in $PBS_O_WORKDIR" >>Log
+echo "-----------------------------" >>Log
+
+
+base="formic.inp"
+restartFile="pt.restart"
+
+if [ "x$restart" == "xy" ]; then
+ Ri=`cat $restartFile | awk '{print $1}'`
+ Rj=`cat $restartFile | awk '{print $2}'`
+
+ Ti=`cat $restartFile | awk '{print $3}'`
+ Tj=`cat $restartFile | awk '{print $4}'`
+ startt=`cat $restartFile | awk '{print $5}'`
+ seed=`cat $restartFile | awk '{print $6}'`
+ randomToSkip=`cat $restartFile | awk '{print $7}'`
+else
+  Ri=-1
+  Rj=-1
+  startt="1"
+  seed="2012"
+  randomToSkip=0
+fi
+
+echo "Ri,Rj,Ti,Tj,startt,tries,restart:$Ri,$Rj,$Ti,$Tj,$startt,$tries,$restart" >> Log
+
+for j in `seq $startt 1 $((startt+tries-1))`; do
+  echo "process step $j out of $((startt+tries-1)) ..." >> Log
+  for i in `seq 1 1 $nTemps`; do
+    tdir=R$i
+    if [ $j -ne "1" ]; then
+      d=`tail -n 1 ${tdir}/Formic_decorations.dat`
+      base="Formic_${d}-1.restart"
+    fi
+    decor="${j}_$T"
+    if [ $i -eq $Ri ]; then
+      decor="${j}_$Tj"     
+      cp $tdir/$base $tdir/Formic_${decor}.inp
+      sed -i "/&EXT_LAGRANGE_SS$/,/&END EXT_LAGRANGE_SS$/d" $tdir/Formic_${decor}.inp
+      sed -i "/&EXT_LAGRANGE_FS$/,/&END EXT_LAGRANGE_FS$/d"  $tdir/Formic_${decor}.inp
+      sed -i "/&EXT_LAGRANGE_VVP$/,/&END EXT_LAGRANGE_VVP$/d"  $tdir/Formic_${decor}.inp
+      sed -i "/&VELOCITIES/,/&END VELOCITIES$/d" $tdir/Formic_${decor}.inp
+      sed -i "0,/TEMPERATURE/{s;\(\s*\)\(TEMPERATURE\).*$;\1\2 $Tj;g}" $tdir/Formic_${decor}.inp
+    elif [ $i -eq $Rj ]; then
+      decor="${j}_$Ti"     
+      cp $tdir/$base $tdir/Formic_${decor}.inp
+      sed -i "/&EXT_LAGRANGE_SS$/,/&END EXT_LAGRANGE_SS$/d" $tdir/Formic_${decor}.inp
+      sed -i "/&EXT_LAGRANGE_FS$/,/&END EXT_LAGRANGE_FS$/d"  $tdir/Formic_${decor}.inp
+      sed -i "/&EXT_LAGRANGE_VVP$/,/&END EXT_LAGRANGE_VVP$/d"  $tdir/Formic_${decor}.inp
+      sed -i "/&VELOCITIES/,/&END VELOCITIES$/d" $tdir/Formic_${decor}.inp
+      sed -i "0,/TEMPERATURE/{s;\s*\(TEMPERATURE\).*$;\1 $Ti;g}" $tdir/Formic_${decor}.inp
+    else 
+     T=`grep -m 1 TEMPERATURE $tdir/$base | awk '{printf "%.2f",$2}'`
+     decor="${j}_$T"
+     cp $tdir/$base $tdir/Formic_${decor}.inp
+    fi
+    sed -i "s;\(\s*\)\(PROJECT_NAME\).*$;\1\2 Formic_${decor};g" $tdir/Formic_${decor}.inp
+    echo $decor >> ${tdir}/Formic_decorations.dat
+
+cat > R${i}.sh << EOF
+#!/bin/bash
+
+cd $tdir
+$cp2k  Formic_${decor}.inp > Formic_${decor}.out
+EOF
+
+    chmod 750 R${i}.sh
+  done
+
+
+  for i in `seq 1 1 $nTemps`
+    do
+      $mpiLaunch -n $procs ./R${i}.sh &
+    done
+    wait
+
+  rm -f tepxepz-${j}.dat
+  echo "#replica | T[K] | epx [Ha] | epz [Ha]" >> tepxepz-${j}.dat
+  for i in `seq 1 1 $nTemps`
+    do
+      tdir=R$i
+      T=`grep -m 1 TEMPERATURE $tdir/Formic_${j}_*.inp  | awk '{printf "%.2f",$2}'`
+      decor="${j}_${T}"
+      epx=`grep "HMC| last " $tdir/Formic_${decor}.out  | awk '{print $6}'`
+      epz=`grep "HMC| last " $tdir/Formic_${decor}.out  | awk '{print $7}'`
+      echo $i $T $epx $epz >> tepxepz-${j}.dat
+    done
+
+  answer=`./exchange.py tepxepz-${j}.dat $seed $randomToSkip| tail -n 1`
+  action=`echo $answer | awk '{print $1}'`
+
+
+  Ri=`echo $answer | awk '{printf "%d", $2}'`
+  Rj=`echo $answer | awk '{printf "%d" ,$3}'`
+
+  Ti=`echo $answer | awk '{printf "%.2f",$4}'`
+  Tj=`echo $answer | awk '{printf "%.2f",$5}'`
+
+  randomToSkip=`echo $answer | awk '{printf "%d" ,$6}'`
+
+  if [ "x$action" == "xswap" ]; then
+    echo "at stop $j swap replicas $Ri with $Rj from T=$Ti, $Tj" >> Log
+  else
+    echo "at stop $j keep replicas $Ri and $Rj with T=$Ti, $Tj" >> Log
+    Ri=-1
+    Rj=-1
+  fi
+
+done
+
+echo "$Ri $Rj $Ti $Tj $((startt+tries)) $seed $randomToSkip" > pt.restart
+echo ">>===========================" >>Log
